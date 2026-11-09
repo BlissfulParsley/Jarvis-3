@@ -1,0 +1,149 @@
+package com.example.jarvis
+
+import android.app.Notification
+import android.content.Context
+import android.content.Intent
+import android.provider.Settings
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
+import android.speech.tts.TextToSpeech
+import androidx.core.app.NotificationManagerCompat
+import java.util.Locale
+
+/*
+ * AndroidManifest.xml (inside <application>):
+ *
+ * <service
+ *     android:name=".JarvisNotificationListener"
+ *     android:exported="false"
+ *     android:label="Jarvis"
+ *     android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+ *     <intent-filter>
+ *         <action android:name="android.service.notification.NotificationListenerService" />
+ *     </intent-filter>
+ * </service>
+ */
+
+data class IncomingMessage(
+    val app: String,
+    val sender: String,
+    val text: String,
+    val time: Long
+)
+
+/** Holds unread messages in memory. */
+object MessageStore {
+    private val unread = mutableListOf<IncomingMessage>()
+
+    @Synchronized
+    fun add(m: IncomingMessage) {
+        val duplicate = unread.any { it.app == m.app && it.sender == m.sender && it.text == m.text }
+        if (!duplicate) unread.add(m)
+    }
+
+    @Synchronized fun count(): Int = unread.size
+
+    @Synchronized
+    fun takeAll(): List<IncomingMessage> {
+        val copy = unread.toList()
+        unread.clear()
+        return copy
+    }
+}
+
+/** Catches message notifications (WhatsApp, SMS, Telegram, Signal, ...). */
+class JarvisNotificationListener : NotificationListenerService() {
+
+    override fun onNotificationPosted(sbn: StatusBarNotification) {
+        val n = sbn.notification ?: return
+
+        // Only messages, and skip the "3 new messages" summary entries
+        if (n.category != Notification.CATEGORY_MESSAGE) return
+        if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+
+        val extras = n.extras
+        val sender = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: return
+        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: return
+
+        val appName = try {
+            val info = packageManager.getApplicationInfo(sbn.packageName, 0)
+            packageManager.getApplicationLabel(info).toString()
+        } catch (e: Exception) {
+            sbn.packageName
+        }
+
+        MessageStore.add(IncomingMessage(appName, sender, text, sbn.postTime))
+    }
+}
+
+/** Text-to-speech wrapper. */
+class VoiceReader(context: Context) {
+    private lateinit var tts: TextToSpeech
+    private var ready = false
+
+    init {
+        tts = TextToSpeech(context.applicationContext) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts.language = Locale.getDefault()
+                ready = true
+            }
+        }
+    }
+
+    fun speak(text: String) {
+        if (ready) tts.speak(text, TextToSpeech.QUEUE_ADD, null, "jarvis-${System.nanoTime()}")
+    }
+
+    fun shutdown() {
+        tts.stop()
+        tts.shutdown()
+    }
+}
+
+/** The assistant part: call these from Brain.kt. */
+class MessageAssistant(private val context: Context, private val voice: VoiceReader) {
+
+    fun hasAccess(): Boolean =
+        NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
+
+    /** One-time: sends the user to the settings screen to grant access. */
+    fun requestAccess() {
+        context.startActivity(
+            Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }
+
+    /** "Do I have new messages?" */
+    fun checkMessages(): String {
+        if (!hasAccess()) return "I need notification access first."
+        val n = MessageStore.count()
+        return when (n) {
+            0 -> "You have no new messages."
+            1 -> "You have 1 new message."
+            else -> "You have $n new messages."
+        }
+    }
+
+    /** "Read my messages" */
+    fun readMessages(): String {
+        if (!hasAccess()) return "I need notification access first."
+        val messages = MessageStore.takeAll()
+        if (messages.isEmpty()) return "You have no new messages."
+
+        messages.forEach { voice.speak("${it.sender} on ${it.app}: ${it.text}") }
+        return "Reading ${messages.size} message${if (messages.size == 1) "" else "s"}."
+    }
+
+    /** Simple command router. Returns null if the command isn't about messages. */
+    fun handle(command: String): String? {
+        val c = command.lowercase(Locale.getDefault())
+        return when {
+            listOf("read my messages", "read messages", "lees mijn berichten").any { c.contains(it) } ->
+                readMessages()
+            listOf("new messages", "any messages", "nieuwe berichten").any { c.contains(it) } ->
+                checkMessages()
+            else -> null
+        }
+    }
+}
